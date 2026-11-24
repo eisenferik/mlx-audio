@@ -1,6 +1,9 @@
 """Tests for DeepFilterNet STS model."""
 
+import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -130,6 +133,57 @@ class TestDeepFilterNetRuntimeHelpers(unittest.TestCase):
         y2 = streamer.flush()
         self.assertIsInstance(y1, np.ndarray)
         self.assertIsInstance(y2, np.ndarray)
+
+
+
+_GRU_LOAD_SCRIPT = r"""
+import json
+import mlx.core as mx
+import mlx.nn as nn
+from mlx_audio.sts.models.deepfilternet.weight_loader import load_weights
+
+class Emb(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.gru_layers = [nn.GRU(4, 4)]
+
+class Model(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.emb = Emb()
+
+model = Model()
+loaded = load_weights(model, {
+    "emb.gru.weight_ih_l0": mx.ones((12, 4)),
+    "emb.gru.weight_hh_l0": mx.ones((12, 4)) * 2,
+    "emb.gru.bias_ih_l0": mx.arange(12, dtype=mx.float32),
+    "emb.gru.bias_hh_l0": mx.arange(100, 112, dtype=mx.float32),
+})
+gru = model.emb.gru_layers[0]
+print(json.dumps({"loaded": loaded, "b": gru.b.tolist(), "bhn": gru.bhn.tolist()}))
+"""
+
+
+class TestDeepFilterNetWeightLoader(unittest.TestCase):
+    def test_gru_bias_folding_does_not_depend_on_hash_seed(self):
+        # The mapping is iterated in set order, which depends on PYTHONHASHSEED,
+        # so bias_ih and bias_hh arrive in either order across processes.
+        bias_ih, bias_hh = list(range(12)), list(range(100, 112))
+        expected = {
+            "loaded": 4,
+            "b": [float(bias_ih[i] + (bias_hh[i] if i < 8 else 0)) for i in range(12)],
+            "bhn": [float(x) for x in bias_hh[8:]],
+        }
+        for seed in range(8):
+            env = dict(os.environ, PYTHONHASHSEED=str(seed))
+            proc = subprocess.run(
+                [sys.executable, "-c", _GRU_LOAD_SCRIPT],
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(json.loads(proc.stdout), expected, f"PYTHONHASHSEED={seed}")
 
 
 @unittest.skipUnless(

@@ -120,6 +120,93 @@ def get_weight_mapping(pt_names: Set[str], mlx_names: Set[str]) -> Dict[str, str
     return mapping
 
 
+def _resolve(model, name: str):
+    """Return (parent, attr) for a dot-separated path, or (None, None)."""
+    parts = name.split(".")
+    obj = model
+
+    try:
+        for part in parts[:-1]:
+            if hasattr(obj, part):
+                obj = getattr(obj, part)
+            elif isinstance(obj, dict) and part in obj:
+                obj = obj[part]
+            elif part.isdigit():
+                idx = int(part)
+                if hasattr(obj, "__getitem__") and len(obj) > idx:
+                    obj = obj[idx]
+                else:
+                    return None, None
+            elif hasattr(obj, "__getitem__"):
+                try:
+                    obj = obj[part]
+                except (KeyError, IndexError, TypeError):
+                    return None, None
+            else:
+                return None, None
+        return obj, parts[-1]
+    except (KeyError, AttributeError, TypeError, IndexError):
+        return None, None
+
+
+def _get_weight(model, name: str):
+    obj, attr = _resolve(model, name)
+    if obj is None or attr is None:
+        return None
+    if hasattr(obj, attr):
+        return getattr(obj, attr)
+    if isinstance(obj, dict) and attr in obj:
+        return obj[attr]
+    return None
+
+
+def _folded_gru_biases(bias_ih: mx.array, bias_hh: mx.array, bhn_current: mx.array):
+    """Map PyTorch GRU biases onto MLX nn.GRU layout.
+
+    MLX nn.GRU stores bhn as the n-gate only [H], while PyTorch bias_hh is [3H].
+    r/z of bias_hh are added to bias_ih. Shapes that already match are unchanged.
+    """
+    if (
+        hasattr(bhn_current, "shape")
+        and len(bhn_current.shape) == 1
+        and len(bias_hh.shape) == 1
+        and bhn_current.shape[0] * 3 == bias_hh.shape[0]
+    ):
+        h = bhn_current.shape[0]
+        rz = bias_hh[: 2 * h]
+        n_gate = bias_hh[2 * h :]
+        rz_pad = mx.concatenate([rz, mx.zeros((h,), dtype=bias_ih.dtype)], axis=0)
+        return bias_ih + rz_pad, n_gate
+    return bias_ih, bias_hh
+
+
+def _load_gru_bias_pair(model, pair: Dict[str, tuple]) -> int:
+    """Apply bias_ih and bias_hh together so the fold cannot depend on arrival order."""
+    b_entry = pair.get("b")
+    bhn_entry = pair.get("bhn")
+    if b_entry is not None and bhn_entry is not None:
+        mlx_b, bias_ih = b_entry
+        mlx_bhn, bias_hh = bhn_entry
+        current_bhn = _get_weight(model, mlx_bhn)
+        if current_bhn is not None:
+            bias_ih, bias_hh = _folded_gru_biases(bias_ih, bias_hh, current_bhn)
+        loaded = 0
+        if set_weight(model, mlx_bhn, bias_hh):
+            loaded += 1
+        if set_weight(model, mlx_b, bias_ih):
+            loaded += 1
+        return loaded
+
+    loaded = 0
+    for entry in (b_entry, bhn_entry):
+        if entry is None:
+            continue
+        mlx_name, value = entry
+        if set_weight(model, mlx_name, value):
+            loaded += 1
+    return loaded
+
+
 def set_weight(model, name: str, value: mx.array) -> bool:
     """Set a weight in the model by dot-separated path.
 
@@ -133,68 +220,25 @@ def set_weight(model, name: str, value: mx.array) -> bool:
     Returns:
         True if successful, False otherwise
     """
-    parts = name.split(".")
-    obj = model
+    obj, final_part = _resolve(model, name)
+    if obj is None or final_part is None:
+        return False
 
     try:
-        # Navigate to the parent object
-        for part in parts[:-1]:
-            # Try attribute first
-            if hasattr(obj, part):
-                obj = getattr(obj, part)
-            # Try dict key
-            elif isinstance(obj, dict) and part in obj:
-                obj = obj[part]
-            # Try integer index for lists/tuples
-            elif part.isdigit():
-                idx = int(part)
-                if hasattr(obj, "__getitem__") and len(obj) > idx:
-                    obj = obj[idx]
-                else:
-                    return False
-            # Try string key access
-            elif hasattr(obj, "__getitem__"):
-                try:
-                    obj = obj[part]
-                except (KeyError, IndexError, TypeError):
-                    return False
-            else:
-                return False
-
-        # Set the final attribute
-        final_part = parts[-1]
-
-        # Special handling for GroupedLinearEinsum weight reshaping
-        # PyTorch uses groups=8, MLX model uses groups=8
-        # Both use weight shape (groups, ws_per_group, hs_per_group)
-        # PyTorch: (8, 64, 32), MLX: (8, 64, 32)
-        # No reshaping needed if groups match
-
         if hasattr(obj, final_part):
-            # MLX nn.GRU uses bhn shape [H] (n-gate only), while PyTorch bias_hh is [3H].
-            # Preserve PyTorch behavior by storing r/z bias_hh for later fold into b.
+            # Unpaired PyTorch bias_hh is [3H] while MLX nn.GRU bhn is [H].
+            # Keep the n-gate; r/z are folded in _load_gru_bias_pair when both arrive.
             if final_part == "bhn":
                 current = getattr(obj, final_part)
                 if (
                     hasattr(current, "shape")
                     and len(current.shape) == 1
                     and len(value.shape) == 1
+                    and current.shape[0] * 3 == value.shape[0]
                 ):
-                    if current.shape[0] * 3 == value.shape[0]:
-                        h = current.shape[0]
-                        rz = value[: 2 * h]
-                        setattr(obj, "_pt_bhn_rz", rz)
-                        setattr(obj, final_part, value[2 * h :])
-                        setattr(obj, "_pt_bhn_folded", False)
-                        return True
-            if final_part == "b" and hasattr(obj, "_pt_bhn_rz"):
-                rz = getattr(obj, "_pt_bhn_rz")
-                h = value.shape[0] // 3
-                rz_pad = mx.concatenate([rz, mx.zeros((h,), dtype=value.dtype)], axis=0)
-                setattr(obj, final_part, value + rz_pad)
-                setattr(obj, "_pt_bhn_folded", True)
-                return True
-
+                    h = current.shape[0]
+                    setattr(obj, final_part, value[2 * h :])
+                    return True
             setattr(obj, final_part, value)
             return True
         elif isinstance(obj, dict) and final_part in obj:
@@ -205,7 +249,6 @@ def set_weight(model, name: str, value: mx.array) -> bool:
             if hasattr(obj, "__setitem__"):
                 obj[idx] = value
                 return True
-
     except (KeyError, AttributeError, TypeError, IndexError):
         pass
 
@@ -230,38 +273,25 @@ def load_weights(model, weights: Dict[str, mx.array]) -> int:
     # Build mapping
     mapping = get_weight_mapping(pt_names, mlx_names)
 
-    # Load weights
-    loaded = 0
+    # GRU b / bhn must be applied as a pair. Mapping iteration follows a set of
+    # strings, whose order is process-randomized by PYTHONHASHSEED.
+    pairs: Dict[str, Dict[str, tuple]] = {}
+    rest = []
     for pt_name, mlx_name in mapping.items():
-        value = weights[pt_name]
+        attr = mlx_name.rsplit(".", 1)[-1]
+        if attr in ("b", "bhn"):
+            parent = mlx_name.rsplit(".", 1)[0]
+            pairs.setdefault(parent, {})[attr] = (mlx_name, weights[pt_name])
+        else:
+            rest.append((mlx_name, weights[pt_name]))
+
+    loaded = 0
+    for mlx_name, value in rest:
         if set_weight(model, mlx_name, value):
             loaded += 1
 
-    # Finalize GRU bias folding for cases where bias_ih loaded before bias_hh.
-    def _finalize_bias_fold(obj):
-        if (
-            hasattr(obj, "_pt_bhn_rz")
-            and hasattr(obj, "b")
-            and getattr(obj, "b") is not None
-        ):
-            if not getattr(obj, "_pt_bhn_folded", False):
-                rz = getattr(obj, "_pt_bhn_rz")
-                b = getattr(obj, "b")
-                h = b.shape[0] // 3
-                rz_pad = mx.concatenate([rz, mx.zeros((h,), dtype=b.dtype)], axis=0)
-                setattr(obj, "b", b + rz_pad)
-                setattr(obj, "_pt_bhn_folded", True)
-        for v in getattr(obj, "__dict__", {}).values():
-            if isinstance(v, list):
-                for it in v:
-                    _finalize_bias_fold(it)
-            elif isinstance(v, dict):
-                for it in v.values():
-                    _finalize_bias_fold(it)
-            elif hasattr(v, "__dict__"):
-                _finalize_bias_fold(v)
-
-    _finalize_bias_fold(model)
+    for pair in pairs.values():
+        loaded += _load_gru_bias_pair(model, pair)
 
     # Load filterbanks - handle both wrapper and direct model cases
     if "erb_fb" in weights:
