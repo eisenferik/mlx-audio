@@ -1,32 +1,37 @@
 # Copyright (c) 2025 Prince Canuma and contributors (https://github.com/Blaizzy/mlx-audio)
 
-from .deepfilternet import (
-    DeepFilterNet2Config,
-    DeepFilterNet3Config,
-    DeepFilterNetConfig,
-    DeepFilterNetModel,
-    DeepFilterNetStreamer,
-    DeepFilterNetStreamingConfig,
-)
-from .lfm_audio import (
-    ChatState,
-    GenerationConfig,
-    LFM2AudioConfig,
-    LFM2AudioModel,
-    LFM2AudioProcessor,
-    LFMModality,
-)
-from .mel_roformer import MelRoFormer, MelRoFormerConfig, MelRoFormerResult
-from .moshi import MoshiConfig, MoshiSTSModel
-from .mossformer2_se import MossFormer2SE, MossFormer2SEConfig, MossFormer2SEModel
-from .sam_audio import (
-    Batch,
-    SAMAudio,
-    SAMAudioConfig,
-    SAMAudioProcessor,
-    SeparationResult,
-    save_audio,
-)
+import importlib
+
+# Submodules are imported on first access, so that using one model does not
+# require the dependencies of every other model.
+_LAZY_EXPORTS = {
+    "DeepFilterNet2Config": "deepfilternet",
+    "DeepFilterNet3Config": "deepfilternet",
+    "DeepFilterNetConfig": "deepfilternet",
+    "DeepFilterNetModel": "deepfilternet",
+    "DeepFilterNetStreamer": "deepfilternet",
+    "DeepFilterNetStreamingConfig": "deepfilternet",
+    "ChatState": "lfm_audio",
+    "GenerationConfig": "lfm_audio",
+    "LFM2AudioConfig": "lfm_audio",
+    "LFM2AudioModel": "lfm_audio",
+    "LFM2AudioProcessor": "lfm_audio",
+    "LFMModality": "lfm_audio",
+    "MelRoFormer": "mel_roformer",
+    "MelRoFormerConfig": "mel_roformer",
+    "MelRoFormerResult": "mel_roformer",
+    "MoshiConfig": "moshi",
+    "MoshiSTSModel": "moshi",
+    "MossFormer2SE": "mossformer2_se",
+    "MossFormer2SEConfig": "mossformer2_se",
+    "MossFormer2SEModel": "mossformer2_se",
+    "Batch": "sam_audio",
+    "SAMAudio": "sam_audio",
+    "SAMAudioConfig": "sam_audio",
+    "SAMAudioProcessor": "sam_audio",
+    "SeparationResult": "sam_audio",
+    "save_audio": "sam_audio",
+}
 
 __all__ = [
     "SAMAudio",
@@ -61,3 +66,13 @@ __all__ = [
     "MelRoFormerConfig",
     "MelRoFormerResult",
 ]
+
+
+def __getattr__(name):
+    if name in _LAZY_EXPORTS:
+        module = importlib.import_module(f"{__name__}.{_LAZY_EXPORTS[name]}")
+        value = getattr(module, name)
+        globals()[name] = value
+        return value
+
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
